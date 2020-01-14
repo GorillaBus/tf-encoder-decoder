@@ -5,6 +5,9 @@ import numpy as np
 import time
 import sys
 import os
+import pyter
+
+
 
 '''
 	Encoder
@@ -26,6 +29,7 @@ class Encoder(tf.keras.Model):
 									   recurrent_dropout=0,						# Forced to 0 for CuDNN_GRU
 									   recurrent_initializer='glorot_uniform')
 
+	@tf.function
 	def call(self, x, hidden, training=False):
 		x = self.embedding(x)
 		output, state = self.gru(x, initial_state=hidden, training=training)
@@ -46,6 +50,7 @@ class BahdanauAttention(tf.keras.layers.Layer):
 		self.W2 = tf.keras.layers.Dense(units)
 		self.V = tf.keras.layers.Dense(1)
 
+	@tf.function
 	def call(self, query, values):
 		# hidden shape == (batch_size, hidden size)
 		# hidden_with_time_axis shape == (batch_size, 1, hidden size)
@@ -89,7 +94,9 @@ class Decoder(tf.keras.Model):
 
 		# used for attention
 		self.attention = BahdanauAttention(self.units)
+		#self.attention = tf.keras.layers.Attention(self.units)
 
+	@tf.function
 	def call(self, x, hidden, enc_output, training=False):
 		# enc_output shape == (batch_size, max_length, hidden_size)
 		context_vector, attention_weights = self.attention(hidden, enc_output)
@@ -128,11 +135,18 @@ class EncoderDecoderWrapper():
 	output_dim:		  		 (int) max decoder sequence tokens (network output)
 	units:					 (int) desired number of GRU units for both layers
 	dropout_rate:			 (float) dropout rate to in GRU units
-	recurrent_dropout_rate:	 (float) recurrent dropout rate to use with GRU units
 	checkpoint_path:		 (string) path where to save checkpoints
 
 	'''
-	def __init__(self, enc_vocab_size=0, dec_vocab_size=0, embedding_dim=0, input_dim=0, output_dim=0, units=64, dropout_rate=0.0, recurrent_dropout_rate=0.0, checkpoint_path='./model_checkpoints'):
+	def __init__(self,
+				enc_vocab_size=0,
+				dec_vocab_size=0,
+				embedding_dim=0,
+				input_dim=0,
+				output_dim=0,
+				units=64,
+				dropout_rate=0.0,
+				checkpoint_path='./model_checkpoints'):
 
 		# Check inputs
 		if (enc_vocab_size < 1 ) | (dec_vocab_size < 1):
@@ -159,8 +173,8 @@ class EncoderDecoderWrapper():
 		# Construction
 		self.input_dim = input_dim
 		self.output_dim = output_dim
-		self.encoder = Encoder(enc_vocab_size, embedding_dim, units, dropout_rate, recurrent_dropout_rate)
-		self.decoder = Decoder(dec_vocab_size, embedding_dim, units, dropout_rate, recurrent_dropout_rate)
+		self.encoder = Encoder(enc_vocab_size, embedding_dim, units, dropout_rate)
+		self.decoder = Decoder(dec_vocab_size, embedding_dim, units, dropout_rate)
 		self.optimizer = tf.keras.optimizers.Adam()
 		self.loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
 		self.__last_saved = 0
@@ -211,7 +225,7 @@ class EncoderDecoderWrapper():
 
 			# Get one batch (steps_per_epoch) and train from it
 			for (batch, (X, y)) in enumerate(train_dataset.take(steps_per_epoch)):
-				batch_loss = self.train_step(X, y)
+				p, batch_loss = self.train_step(X, y)
 				total_loss += batch_loss.numpy()
 
 				# Report batch
@@ -231,7 +245,7 @@ class EncoderDecoderWrapper():
 
 			# Validation
 			if validation_split != 0:
-				val_loss = self.evaluate_dataset(val_dataset,
+				val_loss = self._evaluate_dataset(val_dataset,
 										 total_data=val_length,
 										 batch_size=batch_size,
 										 use_teacher_enforcement=True,  # We need a comparable value
@@ -263,7 +277,7 @@ class EncoderDecoderWrapper():
 				sys.stdout.write("\n* Testing train (nte)...")
 
 				# Train loss
-				nte_train_loss = self.evaluate_dataset(dataset=train_dataset,
+				nte_train_loss = self._evaluate_dataset(dataset=train_dataset,
 											   total_data=train_length,
 											   batch_size=batch_size,
 											   use_teacher_enforcement=False,
@@ -282,7 +296,7 @@ class EncoderDecoderWrapper():
 				if validation_split != 0:
 					sys.stdout.write("\r* Testing validation (nte)...")
 
-					nte_val_loss = self.evaluate_dataset(dataset=val_dataset,
+					nte_val_loss = self._evaluate_dataset(dataset=val_dataset,
 												 total_data=val_length,
 												 batch_size=batch_size,
 												 use_teacher_enforcement=False,
@@ -302,6 +316,94 @@ class EncoderDecoderWrapper():
 			sys.stdout.flush()
 
 		return history
+
+
+
+	'''
+		Trains the network from a dataset batch or single X, y pair
+
+		X:			tensor with input data with batch_size dimension
+		y:			tensor with data labels (X paired)
+
+		returns:	(batch) loss mean
+
+	'''
+	@tf.function
+	def train_step(self, X, y):
+		with tf.GradientTape() as tape:
+			# Feed forward the full batch and get the mean error
+			pred, loss = self.forward(X, y, training=True)
+
+			# Compute gradient and update parameters
+			variables = self.encoder.trainable_variables + self.decoder.trainable_variables
+			gradients = tape.gradient(loss, variables)
+			self.optimizer.apply_gradients(zip(gradients, variables))
+		return pred, loss
+
+
+
+	'''
+		Test step
+
+	'''
+	@tf.function
+	def test_step(self, X, y):
+
+		# Feed forward the full batch and get the mean error
+		pred, loss = self.forward(X, y, training=False)
+
+		return pred, loss
+
+
+
+	'''
+		Forward passes a full batch
+
+	'''
+	@tf.function
+	def forward(self, X, y=None, use_teacher_enforcement=True, training=False):
+		y_is_tensor = tf.is_tensor(y)
+
+		# Initial encoder hidden state
+		enc_hidden = self.encoder.initialize_hidden_state(X.shape[0])
+
+		# Encoder forward pass
+		enc_output, enc_hidden = self.encoder(X, enc_hidden, training=training)
+		dec_hidden = enc_hidden
+		dec_input = tf.expand_dims([1] * X.shape[0], 1) # 1 = dictionary index for "<start>"
+
+		# Output
+		loss = 0
+		#prediction = tf.expand_dims([1] * X.shape[0], 1)
+		prediction = []
+
+		# Decoder forward pass
+		for t in range(1, self.output_dim):
+			# passing enc_output to the decoder
+			predictions, dec_hidden, _ = self.decoder(dec_input, dec_hidden, enc_output, training=training)
+
+			#predicted_ids = tf.argmax(predictions, axis=1, output_type=tf.dtypes.int32)
+			predicted_ids = tf.argmax(predictions, axis=1)
+
+			#prediction = tf.concat([ prediction, tf.reshape(predicted_ids, [predicted_ids.shape[0], 1]) ], 1)
+			prediction = tf.concat([prediction, predicted_ids], 0)
+
+			# Teacher enforcement
+			if y_is_tensor & use_teacher_enforcement:
+				dec_input = tf.expand_dims(y[:, t], 1)
+			else:
+				dec_input = tf.expand_dims(predicted_ids, 1)
+
+			# Loss
+			if y_is_tensor:
+				loss += self.loss_fn(y[:, t], predictions)
+
+		# Mean loss
+		if y_is_tensor:
+			loss /= int(y.shape[1])
+
+		return [prediction, loss]
+
 
 
 	'''
@@ -324,9 +426,10 @@ class EncoderDecoderWrapper():
 		self.decoder.load_weights('./model_checkpoints/decoder/')
 
 
+
 	'''
 		Evaluate the model with labeled data
-		(This is an interafce to self.evaluate_dataset)
+		(This is an interafce to self._evaluate_dataset)
 
 		X:							(tensor) with input data
 		y:							(tensor) with data labels (X paired)
@@ -334,14 +437,14 @@ class EncoderDecoderWrapper():
 		use_teacher_enforcement:	(boolean) use teacher enforcement
 		verbose:					(boolean) print status
 
-		returns:					self.evaluate_dataset() output
+		returns:					self._evaluate_dataset() output
 	'''
 	def evaluate(self, X, y, batch_size=64, use_teacher_enforcement=False, verbose=True):
 
 		# Create TF dataset
 		ds, length = self.create_tf_dataset(X, y, batch_size)
 
-		return self.evaluate_dataset(dataset=ds, total_data=length, batch_size=batch_size, use_teacher_enforcement=use_teacher_enforcement, verbose=verbose)
+		return self._evaluate_dataset(dataset=ds, total_data=length, batch_size=batch_size, use_teacher_enforcement=use_teacher_enforcement, verbose=verbose)
 
 
 
@@ -357,8 +460,7 @@ class EncoderDecoderWrapper():
 		returns:					(float) mean dataset loss
 
 	'''
-	def evaluate_dataset(self, dataset=None, total_data=0, batch_size=64, use_teacher_enforcement=False, verbose=True):
-
+	def _evaluate_dataset(self, dataset=None, total_data=0, batch_size=64, use_teacher_enforcement=False, verbose=True):
 		# Check input
 		if dataset is None:
 			raise ValueError('dataset is required')
@@ -388,69 +490,6 @@ class EncoderDecoderWrapper():
 		return total_loss / steps_per_epoch
 
 
-
-	'''
-		Encodes / Decodes an array of IDs representing a sentence
-
-		word_id_list:			   (np array) a NumPy array of source word IDs
-		use_teacher_enforcement:	(boolean) use teacher enforment
-		training:				   (boolean) training flag to switch dropout and others
-
-		returns:					(np array) a NumPy array of target word IDs
-
-	'''
-	def decode(self, word_id_list):
-		p, l = self.forward(X=word_id_list, use_teacher_enforcement=False, training=False)
-		return p.numpy()
-
-
-
-	'''
-		Forward passes a full batch
-	'''
-	@tf.function
-	def forward(self, X, y=None, use_teacher_enforcement=True, training=False):
-		y_is_tensor = tf.is_tensor(y)
-
-		# Initial encoder hidden state
-		enc_hidden = self.encoder.initialize_hidden_state(X.shape[0])
-
-		# Encoder forward pass
-		enc_output, enc_hidden = self.encoder(X, enc_hidden, training=training)
-		dec_hidden = enc_hidden
-		dec_input = tf.expand_dims([1] * X.shape[0], 1) # 1 = dictionary index for "<start>"
-
-
-		# Output
-		loss = 0
-		prediction = []
-
-		# Decoder forward pass
-		for t in range(1, self.output_dim):
-			# passing enc_output to the decoder
-			predictions, dec_hidden, _ = self.decoder(dec_input, dec_hidden, enc_output, training=training)
-			predicted_ids = tf.argmax(predictions, axis=1)
-			prediction = tf.concat([prediction, predicted_ids], 0)
-
-			# Teacher enforcement
-			if y_is_tensor & use_teacher_enforcement:
-				dec_input = tf.expand_dims(y[:, t], 1)
-			else:
-				dec_input = tf.expand_dims(predicted_ids, 1)
-
-
-			# Loss
-			if y_is_tensor:
-				loss += self.loss_fn(y[:, t], predictions)
-
-		# Mean loss
-		if y_is_tensor:
-			loss /= int(y.shape[1])
-
-		return [prediction, loss]
-
-
-
 	'''
 		Fixed loss function (SparseCategoricalCrossentropy)
 
@@ -465,31 +504,8 @@ class EncoderDecoderWrapper():
 
 
 	'''
-		Trains the network from a dataset batch or single X, y pair
+		* Helper method, shold move somewhere else in the future
 
-		X:			  tensor with input data with batch_size dimension
-		y:			  tensor with data labels (X paired)
-
-		returns:		(batch) loss mean
-
-	'''
-	@tf.function
-	def train_step(self, X, y):
-		loss = 0
-
-		with tf.GradientTape() as tape:
-			# Feed forward the full batch and get the mean error
-			pred, loss = self.forward(X, y, training=True)
-
-			# Compute gradient and update parameters
-			variables = self.encoder.trainable_variables + self.decoder.trainable_variables
-			gradients = tape.gradient(loss, variables)
-			self.optimizer.apply_gradients(zip(gradients, variables))
-		return loss
-
-
-
-	'''
 		Creates a tf.data.Dataset object to feed the network
 		with tensors and in batches
 
@@ -509,81 +525,12 @@ class EncoderDecoderWrapper():
 
 
 
-class Evaluator():
-	def __init__(self, model=None, dh=None, input_dict=None, output_dict=None):
-
-		# Verify we got model and data handler injected during construction
-		if model is None:
-			print("Error: an EncoderDecoderWrapper instance must be provided")
-			return False
-
-		if dh is None:
-			print("Error: a PreProcessor instance must be provided")
-			return False
-
-		if not isinstance(input_dict, tf.keras.preprocessing.text.Tokenizer):
-			print("Error: invalid input_dict")
-			return False
-
-		if not isinstance(output_dict, tf.keras.preprocessing.text.Tokenizer):
-			print("Error: invalid output_dict")
-			return False
-
-		self._model = model
-		self.dh = dh
-		self.input_dict = input_dict
-		self.output_dict = output_dict
-
-
-
-	def test(self, sentence):
-		attention_plot = np.zeros((self._model.output_dim, self._model.input_dim))
-
-		sentence = self.dh.process_sentence(sentence)
-
-		inputs = [self.input_dict.word_index[i] for i in sentence.split(' ')]
-		inputs = tf.keras.preprocessing.sequence.pad_sequences([inputs],
-															 maxlen=self._model.input_dim,
-															 padding='post')
-		inputs = tf.convert_to_tensor(inputs)
-
-		result = ''
-
-		hidden = [tf.zeros((1, self._model.encoder.units))]
-		enc_out, enc_hidden = self._model.encoder(inputs, hidden)
-
-		dec_hidden = enc_hidden
-		dec_input = tf.expand_dims([self.output_dict.word_index['<start>']], 0)
-
-		for t in range(self._model.output_dim):
-			predictions, dec_hidden, attention_weights = self._model.decoder(dec_input,
-																 dec_hidden,
-																 enc_out)
-
-			# storing the attention weights to plot later on
-			attention_weights = tf.reshape(attention_weights, (-1, ))
-			attention_plot[t] = attention_weights.numpy()
-
-			predicted_id = tf.argmax(predictions[0]).numpy()
-
-			result += self.output_dict.index_word[predicted_id] + ' '
-
-			if self.output_dict.index_word[predicted_id] == '<end>':
-				return result, sentence, attention_plot
-
-			# the predicted ID is fed back into the model
-			dec_input = tf.expand_dims([predicted_id], 0)
-
-		return result, sentence, attention_plot
-
-
-
-
 '''
 	HELPERS
+
 '''
 
 def calc_normal_diff(a, b):
-        max_err = max(a, b)
-        error_diff = max_err - min(a, b)
-        return error_diff * 100 / max_err
+		max_err = max(a, b)
+		error_diff = max_err - min(a, b)
+		return error_diff * 100 / max_err
