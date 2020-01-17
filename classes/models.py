@@ -381,7 +381,7 @@ class EncoderDecoderWrapper():
 			predictions, dec_hidden, _ = self.decoder(dec_input, dec_hidden, enc_output, training=training)
 
 			# Get batch_predictions from the softmax output
-			predicted_ids = tf.expand_dims(tf.argmax(predictions, axis=1, output_type=tf.dtypes.int32), 1)
+			predicted_ids = tf.argmax(predictions, axis=1, output_type=tf.dtypes.int32)
 
 			# Calculate loss if we have ground true values
 			if y_is_tensor:
@@ -391,10 +391,11 @@ class EncoderDecoderWrapper():
 				if use_teacher_enforcement:
 					dec_input = tf.expand_dims(y[:, t], 1)
 				else:
-					dec_input = predicted_ids
+					dec_input = tf.expand_dims(predicted_ids, 1)
 
-			# Accumulate batch predictions
-			batch_predictions = tf.concat([ batch_predictions, predicted_ids ], 1)
+					# Accumulate batch predictions only if NOT training
+					if not training:
+						batch_predictions = tf.concat([ batch_predictions, dec_input ], 1)
 
 
 		# Mean loss
