@@ -525,6 +525,140 @@ class EncoderDecoderWrapper():
 
 
 
+
+class Evaluator():
+	def __init__(self, model=None, dh=None, input_dict=None, output_dict=None):
+
+		# Verify we got model and data handler injected during construction
+		if model is None:
+			print("Error: an EncoderDecoderWrapper instance must be provided")
+			return False
+
+		if dh is None:
+			print("Error: a PreProcessor instance must be provided")
+			return False
+
+		if not isinstance(input_dict, tf.keras.preprocessing.text.Tokenizer):
+			print("Error: invalid input_dict")
+			return False
+
+		if not isinstance(output_dict, tf.keras.preprocessing.text.Tokenizer):
+			print("Error: invalid output_dict")
+			return False
+
+		self._model = model
+		self.dh = dh
+		self.input_dict = input_dict
+		self.output_dict = output_dict
+
+
+	def test_batch(self, X, y, batch_size=64, verbose=True):
+
+		# Create TF dataset
+		dataset, length = self._model.create_tf_dataset(X, y, batch_size)
+		steps_per_batch = length // batch_size
+
+		# Initialize
+		total_loss = 0
+		y_words = []
+		yy_words = []
+
+		# Get one batch (steps_per_epoch) and train from it
+		for (batch, (X_batch, y_batch)) in enumerate(dataset.take(64)):
+			batch_preds, batch_loss = self._model.test_step(X_batch, y_batch)
+
+			# Accumulate loss
+			total_loss += batch_loss.numpy()
+
+			# Convert IDs to words and accumulate predictions
+			yy_words.append(self.batch_to_words(batch_preds.numpy()))
+
+			# Convert ground true ids to words
+			y_words.append(self.batch_to_words(y_batch.numpy()))
+
+		# Slice predicted sentences from <strt> to <stop>
+		yy_words = [ yy[1: yy.index('<end>') if '<end>' in yy else len(yy)] for yy in yy_words ]
+		y_words = [ y[1: y.index('<end>')] for y in y_words ]
+
+		return yy_words, y_words, total_loss
+
+
+
+	def test(self, sentence):
+		attention_plot = np.zeros((self._model.output_dim, self._model.input_dim))
+
+		sentence = self.dh.process_sentence(sentence)
+
+		inputs = [self.input_dict.word_index[i] for i in sentence.split(' ')]
+		inputs = tf.keras.preprocessing.sequence.pad_sequences([inputs],
+															 maxlen=self._model.input_dim,
+															 padding='post')
+		inputs = tf.convert_to_tensor(inputs)
+
+		result = ''
+
+		hidden = [tf.zeros((1, self._model.encoder.units))]
+		enc_out, enc_hidden = self._model.encoder(inputs, hidden)
+
+		dec_hidden = enc_hidden
+		dec_input = tf.expand_dims([self.output_dict.word_index['<start>']], 0)
+
+		for t in range(self._model.output_dim):
+			predictions, dec_hidden, attention_weights = self._model.decoder(dec_input,
+																 dec_hidden,
+																 enc_out)
+
+			# storing the attention weights to plot later on
+			attention_weights = tf.reshape(attention_weights, (-1, ))
+			attention_plot[t] = attention_weights.numpy()
+
+			predicted_id = tf.argmax(predictions[0]).numpy()
+
+			result += self.output_dict.index_word[predicted_id] + ' '
+
+			if self.output_dict.index_word[predicted_id] == '<end>':
+				return result, sentence, attention_plot
+
+			# the predicted ID is fed back into the model
+			dec_input = tf.expand_dims([predicted_id], 0)
+
+		return result, sentence, attention_plot
+
+	def compute_ter_score(hyp, ref):
+		return pyter.ter(hyp, ref)
+
+	def evaluate_ter_batch(H, R):
+		batch_score = 0
+		for hyp, ref in zip(H, R):
+			batch_score += compute_ter_score(hyp, ref)
+		return batch_score / len(H)
+
+	def batch_to_words(self, word_ids, dict=1):
+		words = []
+		for sentence in word_ids:
+			s = []
+			for wid in sentence:
+
+				if wid < 1: # <start> or <stop>
+					continue
+
+				# Choose output dictionary
+				if dict == 1:
+					t = self.output_dict.index_word[wid]
+				else:
+					t = self.input_dict.index_word[wid]
+
+				s.append(t)
+
+			words.append(s)
+
+		return words[0]
+
+
+
+
+
+
 '''
 	HELPERS
 
