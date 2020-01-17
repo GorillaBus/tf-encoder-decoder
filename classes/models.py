@@ -350,8 +350,7 @@ class EncoderDecoderWrapper():
 	def test_step(self, X, y):
 
 		# Feed forward the full batch and get the mean error
-		pred, loss = self.forward(X, y, training=False)
-
+		pred, loss = self.forward(X, y, use_teacher_enforcement=False, training=False)
 		return pred, loss
 
 
@@ -361,7 +360,7 @@ class EncoderDecoderWrapper():
 
 	'''
 	@tf.function
-	def forward(self, X, y=None, use_teacher_enforcement=True, training=False):
+	def forward(self, X, y=None, use_teacher_enforcement=False, training=False):
 		y_is_tensor = tf.is_tensor(y)
 
 		# Initial encoder hidden state
@@ -374,35 +373,36 @@ class EncoderDecoderWrapper():
 
 		# Output
 		loss = 0
-		#prediction = tf.expand_dims([1] * X.shape[0], 1)
-		prediction = []
+		batch_predictions = tf.expand_dims([1] * X.shape[0], 1)
 
 		# Decoder forward pass
 		for t in range(1, self.output_dim):
 			# passing enc_output to the decoder
 			predictions, dec_hidden, _ = self.decoder(dec_input, dec_hidden, enc_output, training=training)
 
-			#predicted_ids = tf.argmax(predictions, axis=1, output_type=tf.dtypes.int32)
-			predicted_ids = tf.argmax(predictions, axis=1)
+			# Get batch_predictions from the softmax output
+			predicted_ids = tf.expand_dims(tf.argmax(predictions, axis=1, output_type=tf.dtypes.int32), 1)
 
-			#prediction = tf.concat([ prediction, tf.reshape(predicted_ids, [predicted_ids.shape[0], 1]) ], 1)
-			prediction = tf.concat([prediction, predicted_ids], 0)
-
-			# Teacher enforcement
-			if y_is_tensor & use_teacher_enforcement:
-				dec_input = tf.expand_dims(y[:, t], 1)
-			else:
-				dec_input = tf.expand_dims(predicted_ids, 1)
-
-			# Loss
+			# Calculate loss if we have ground true values
 			if y_is_tensor:
 				loss += self.loss_fn(y[:, t], predictions)
+
+				# Use teacher enforcement?
+				if use_teacher_enforcement:
+					dec_input = tf.expand_dims(y[:, t], 1)
+				else:
+					dec_input = predicted_ids
+
+			# Accumulate batch predictions
+			batch_predictions = tf.concat([ batch_predictions, predicted_ids ], 1)
+
 
 		# Mean loss
 		if y_is_tensor:
 			loss /= int(y.shape[1])
 
-		return [prediction, loss]
+		return [batch_predictions, loss]
+
 
 
 
